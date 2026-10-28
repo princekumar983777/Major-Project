@@ -1,0 +1,218 @@
+%% PLANAR 2R ROBOT ARM - DESIGN WORKFLOW IN MATLAB
+% Steps 1-9: kinematics -> trajectory -> torque -> motor sizing -> control sim
+% Needs MATLAB R2016b or newer (local functions inside a script).
+% Units: SI (m, kg, s, N*m, rad). Angles are in radians inside formulas.
+clear; clc; close all;
+    
+% % ---------------- STEP    0: TASK + ROBOT DATA ---------------
+
+l1 = 0.30;  l2 = 0.25;              % link lengths [m]
+m1 = 0.50;  m2 = 0.30;  mp = 0.10;  % link masses, payload [kg]
+g  = 9.81;                          % set g = 0 for a HORIZONTAL-plane arm
+
+% TASK is to move in a circle : specification are listed bellow
+
+xc = 0.30;  yc = 0.15;              % circle centre [m]
+R  = 0.08;                          % circle radius [m]
+T  = 4;                             % time for one lap [s]
+branch = +1;                        % +1: theta2 > 0 ,  -1: theta2 < 0
+
+P = makeParams(l1, l2, m1, m2, mp, g);
+
+%% ---------------- STEP 2: WORKSPACE CHECK ----------------
+fprintf('Workspace ring: %.3f m <= r <= %.3f m\n', abs(l1-l2), l1+l2);
+
+%% ---------------- STEP 6: TRAJECTORY (Cartesian circle) ----------------
+t = linspace(0, T, 2001);
+[s, sd, sdd] = quintic(t, T);
+
+ph    = pi + 2*pi*s;                % start at the left of the circle
+phd   = 2*pi*sd;
+phdd  = 2*pi*sdd;
+
+X   = xc + R*cos(ph);               Y   = yc + R*sin(ph);
+Xd  = -R*sin(ph).*phd;              Yd  =  R*cos(ph).*phd;
+Xdd = -R*cos(ph).*phd.^2 - R*sin(ph).*phdd;
+Ydd = -R*sin(ph).*phd.^2 + R*cos(ph).*phdd;
+
+r = hypot(X, Y);
+fprintf('Path radial range: %.3f to %.3f m\n', min(r), max(r));
+% ----------------STEPS 3,5,7: IK, JACOBIAN, DYNAMICS ALONG PATH -----
+N  = numel(t);
+TH = zeros(2,N);  W = zeros(2,N);  A = zeros(2,N);  TAU = zeros(2,N);
+M11 = zeros(1,N); M22 = zeros(1,N); detJ = zeros(1,N);
+
+for k = 1:N
+    th = ik(X(k), Y(k), branch, P);                 % Step 3
+    J  = jacobian(th, P);                           % Step 5
+    w  = J \ [Xd(k); Yd(k)];                        % joint speeds
+    a  = J \ ([Xdd(k); Ydd(k)] - jacobianDot(th, w, P)*w);   % joint accel.
+    [M, V, G] = dyn(th, w, P);                      % Step 7
+    TH(:,k) = th;  W(:,k) = w;  A(:,k) = a;
+    TAU(:,k) = M*a + V + G;
+    M11(k) = M(1,1);  M22(k) = M(2,2);
+    detJ(k) = det(J);
+end
+TH = unwrap(TH, [], 2);                             % avoid +-pi jumps
+
+peakTau = max(abs(TAU), [], 2);
+rmsTau  = sqrt(mean(TAU.^2, 2));
+peakW   = max(abs(W), [], 2);
+peakA   = max(abs(A), [], 2);
+fprintf('\n--- Joint results (g = %.2f) ---\n', g);
+fprintf('theta1 range: %.1f to %.1f deg\n', rad2deg(min(TH(1,:))), rad2deg(max(TH(1,:))));
+fprintf('theta2 range: %.1f to %.1f deg\n', rad2deg(min(TH(2,:))), rad2deg(max(TH(2,:))));
+fprintf('Peak speed  [rad/s]  : %.2f  %.2f\n', peakW);
+fprintf('Peak accel  [rad/s^2]: %.2f  %.2f\n', peakA);
+fprintf('Peak torque [N m]    : %.3f  %.3f\n', peakTau);
+fprintf('RMS torque  [N m]    : %.3f  %.3f\n', rmsTau);
+fprintf('min |det J| = %.4f m^2 (0 would be a singularity)\n', min(abs(detJ)));
+
+%% ---------------- STEP 8: MOTOR + GEAR SIZING ----------------
+Gear = [50 50];                 % gear ratio N for each joint
+eta  = [0.8 0.8];               % gearbox efficiency
+Jm   = [1e-6 1e-6];             % motor rotor inertia [kg m^2]
+CPR  = 500;                     % encoder lines per rev (motor shaft)
+margin = 2;                     % safety factor
+
+fprintf('\n--- Motor sizing (margin x%.1f) ---\n', margin);
+for i = 1:2
+    tauM  = TAU(i,:)/(Gear(i)*eta(i)) + Jm(i)*Gear(i)*A(i,:);
+    peakM = max(abs(tauM));
+    rmsM  = sqrt(mean(tauM.^2));
+    rpm   = Gear(i)*peakW(i)*60/(2*pi);
+    resol = 2*pi/(4*CPR*Gear(i));                 % joint resolution [rad]
+    fprintf(['Joint %d: motor peak %.4f N m, RMS %.4f N m, speed %.0f rpm  ', ...
+             '=> choose motor with peak >= %.3f, rated >= %.3f N m\n'], ...
+             i, peakM, rmsM, rpm, margin*peakM, margin*rmsM);
+    fprintf('         encoder resolution %.2e rad -> tip %.3f mm\n', ...
+             resol, (l1+l2)*resol*1e3);
+end
+% (Gear ratio / inertia matching: Nopt = sqrt(JL/Jm), JL = M11 or M22)
+fprintf('Inertia-matching N_opt: joint1 %.0f, joint2 %.0f\n', ...
+        sqrt(max(M11)/Jm(1)), sqrt(max(M22)/Jm(2)));
+
+%% ---------------- STEP 9: CONTROL SIMULATION (PD + gravity + feedforward) ----------------
+f_bw  = 2;                              % target bandwidth [Hz]
+wn    = 2*pi*f_bw;
+Ieff  = [max(M11); max(M22)];
+Kp    = diag(Ieff*wn^2);
+Kv    = diag(2*Ieff*wn);                % zeta = 1 (critical damping)
+fprintf('\nGains: Kp = [%.2f %.2f], Kv = [%.3f %.3f]\n', diag(Kp), diag(Kv));
+
+ctrl = struct('t',t, 'TH',TH, 'W',W, 'A',A, 'Kp',Kp, 'Kv',Kv, 'Ieff',Ieff);
+b_fric = [0.02; 0.01];                  % viscous friction in the REAL arm
+Pmodel = P;                             % what the controller believes
+Preal  = makeParams(l1, l2, 1.10*m1, 1.10*m2, mp, g);   % +10 % mass error
+
+y0 = [TH(:,1); zeros(2,1)];
+[ts, Ysim] = ode45(@(tt,y) plantODE(tt, y, Preal, Pmodel, ctrl, b_fric), ...
+                [0 T], y0, odeset('RelTol',1e-6,'AbsTol',1e-8));
+[xs, ys] = fk(Ysim(:,1), Ysim(:,2), P);
+
+%% ---------------- PLOTS ----------------
+figure('Name','Path and arm poses'); hold on; axis equal; grid on;
+th_ring = linspace(0,2*pi,400);
+plot((l1+l2)*cos(th_ring), (l1+l2)*sin(th_ring), 'k--');
+plot(abs(l1-l2)*cos(th_ring), abs(l1-l2)*sin(th_ring), 'k--');
+plot(X, Y, 'r', 'LineWidth', 2);
+for k = round(linspace(1,N,6))
+    ex = l1*cos(TH(1,k));  ey = l1*sin(TH(1,k));
+    plot([0 ex X(k)], [0 ey Y(k)], 'b-o');
+end
+xlabel('x [m]'); ylabel('y [m]'); title('Workspace ring, path, and arm poses');
+
+figure('Name','Joint motion');
+subplot(3,1,1); plot(t, rad2deg(TH)); grid on; ylabel('\theta [deg]'); legend('\theta_1','\theta_2');
+subplot(3,1,2); plot(t, W);           grid on; ylabel('\omega [rad/s]');
+subplot(3,1,3); plot(t, A);           grid on; ylabel('\alpha [rad/s^2]'); xlabel('t [s]');
+
+figure('Name','Torque');
+plot(t, TAU, 'LineWidth', 1.3); grid on;
+xlabel('t [s]'); ylabel('Torque [N m]'); legend('\tau_1','\tau_2');
+title('Required joint torques');
+
+figure('Name','Tracking in simulation');
+xd_i = interp1(t, X, ts); yd_i = interp1(t, Y, ts);   % desired at sim times
+plot(ts, 1e3*hypot(xs(:)-xd_i(:), ys(:)-yd_i(:)), 'LineWidth', 1.3); grid on;
+xlabel('t [s]'); ylabel('Tip error [mm]');
+title('Tip tracking error (PD + gravity comp., +10% mass error, friction)');
+
+%% =====================================================================
+%                          LOCAL FUNCTIONS
+%  =====================================================================
+function P = makeParams(l1, l2, m1, m2, mp, g)
+    P.l1 = l1; P.l2 = l2; P.m1 = m1; P.g = g;
+    P.M2  = m2 + mp;                                  % composite link 2
+    P.lc1 = l1/2;
+    P.lc2 = (m2*l2/2 + mp*l2)/P.M2;
+    P.I1  = m1*l1^2/12;
+    P.I2  = m2*l2^2/12 + m2*(l2/2 - P.lc2)^2 + mp*(l2 - P.lc2)^2;
+end
+
+function [x, y] = fk(th1, th2, P)                     % Step 1
+    x = P.l1*cos(th1) + P.l2*cos(th1+th2);
+    y = P.l1*sin(th1) + P.l2*sin(th1+th2);
+end
+
+function th = ik(x, y, branch, P)                     % Step 3
+    c2 = (x^2 + y^2 - P.l1^2 - P.l2^2)/(2*P.l1*P.l2);
+    if abs(c2) > 1
+        if abs(c2) < 1 + 1e-9, c2 = sign(c2); else
+            error('Target (%.3f, %.3f) is outside the workspace.', x, y);
+        end
+    end
+    s2  = branch*sqrt(1 - c2^2);
+    th2 = atan2(s2, c2);
+    th1 = atan2(y, x) - atan2(P.l2*s2, P.l1 + P.l2*c2);
+    th  = [th1; th2];
+end
+
+function J = jacobian(th, P)                          % Step 5
+    s1 = sin(th(1));  c1 = cos(th(1));
+    s12 = sin(th(1)+th(2));  c12 = cos(th(1)+th(2));
+    J = [-P.l1*s1 - P.l2*s12, -P.l2*s12;
+          P.l1*c1 + P.l2*c12,  P.l2*c12];
+end
+
+function Jd = jacobianDot(th, w, P)
+    s1 = sin(th(1));  c1 = cos(th(1));
+    s12 = sin(th(1)+th(2));  c12 = cos(th(1)+th(2));
+    w12 = w(1) + w(2);
+    Jd = [-P.l1*c1*w(1) - P.l2*c12*w12, -P.l2*c12*w12;
+          -P.l1*s1*w(1) - P.l2*s12*w12, -P.l2*s12*w12];
+end
+
+function [s, sd, sdd] = quintic(t, T)                 % Step 6 time scaling
+    u   = t/T;
+    s   = 10*u.^3 - 15*u.^4 + 6*u.^5;
+    sd  = (30*u.^2 - 60*u.^3 + 30*u.^4)/T;
+    sdd = (60*u - 180*u.^2 + 120*u.^3)/T^2;
+end
+
+function [M, V, G] = dyn(th, w, P)                    % Step 7
+    c2 = cos(th(2));  s2 = sin(th(2));
+    M11 = P.m1*P.lc1^2 + P.M2*(P.l1^2 + P.lc2^2 + 2*P.l1*P.lc2*c2) + P.I1 + P.I2;
+    M12 = P.M2*(P.lc2^2 + P.l1*P.lc2*c2) + P.I2;
+    M22 = P.M2*P.lc2^2 + P.I2;
+    M   = [M11 M12; M12 M22];
+    h   = -P.M2*P.l1*P.lc2*s2;
+    V   = [ h*(2*w(1)*w(2) + w(2)^2);
+           -h*w(1)^2 ];
+    G   = [ (P.m1*P.lc1 + P.M2*P.l1)*P.g*cos(th(1)) + P.M2*P.lc2*P.g*cos(th(1)+th(2));
+             P.M2*P.lc2*P.g*cos(th(1)+th(2)) ];
+end
+
+function dy = plantODE(tt, y, Preal, Pmodel, ctrl, b)  % Step 9/10 simulation
+    th = y(1:2);  w = y(3:4);
+    thd = interp1(ctrl.t, ctrl.TH', tt, 'spline')';
+    wd  = interp1(ctrl.t, ctrl.W',  tt, 'spline')';
+    ad  = interp1(ctrl.t, ctrl.A',  tt, 'spline')';
+    % controller: PD + gravity compensation + inertia feedforward
+    [~, ~, Gm] = dyn(th, w, Pmodel);
+    tau = ctrl.Kp*(thd - th) + ctrl.Kv*(wd - w) + Gm + ctrl.Ieff.*ad;
+    % real arm: M*acc + V + G + friction = tau
+    [M, V, G] = dyn(th, w, Preal);
+    acc = M \ (tau - V - G - b.*w);
+    dy  = [w; acc];
+end
